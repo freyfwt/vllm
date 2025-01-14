@@ -51,9 +51,12 @@ def get_beam_search_score(
 ) -> float:
     """Calculate the beam search score with length penalty.
 
-    Adapted from
+    Different with
 
     https://github.com/huggingface/transformers/blob/ccb92be23def445f2afdea94c31286f84b89eb5b/src/transformers/generation/beam_search.py#L938
+
+    Note that the `cumulative_logprob` is a negative value. To make the result decrease as the length penalty increases,
+    multiplication should be used here.
     """
     seq_len = len(tokens)
     if tokens[-1] == eos_token_id:
