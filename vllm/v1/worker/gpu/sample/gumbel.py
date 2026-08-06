@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterator
-
 import torch
 
 from vllm.triton_utils import tl, triton
-
-GUMBEL_BLOCK_SIZE = 1024
-MAX_TRITON_PROGRAMS_PER_LAUNCH = 65_535
-_FP32_UNIT_ROUNDOFF: tl.constexpr = 2.0**-24
-_FP64_UNIT_ROUNDOFF: tl.constexpr = 2.0**-53
-_LOG1P_NEG_SERIES_CUTOFF: tl.constexpr = 0.25
 
 
 @triton.jit
@@ -100,7 +92,7 @@ def murmur3_uniform32(seed, pos, offset):
     random24 = murmur3_hash32(seed, pos, offset) >> 8
     # random24 fits in signed int32. The intermediate cast also avoids a
     # uint32-to-float conversion that is unsupported by Ascend BiShengIR.
-    return (random24.to(tl.int32).to(tl.float32) + 0.5) * _FP32_UNIT_ROUNDOFF
+    return (random24.to(tl.int32).to(tl.float32) + 0.5) * 5.960464477539063e-08
 
 
 @triton.jit
@@ -108,14 +100,15 @@ def murmur3_uniform64(seed, pos, offset):
     lo = murmur3_hash32(seed, pos, offset).to(tl.uint64)
     hi = murmur3_hash32(seed, pos, offset, domain=0x9E3779B9).to(tl.uint64)
     random53 = ((hi << 32) | lo) >> 11
-    return (random53.to(tl.float64) + 0.5) * _FP64_UNIT_ROUNDOFF
+    return (random53.to(tl.float64) + 0.5) * 1.1102230246251565e-16
 
 
 @triton.jit
-def _log1p_neg(value):
-    """Compute log1p(-value) without relying on a backend libdevice."""
-    # Horner form of -sum(value**k / k, k=1..8). Its absolute error stays
-    # below 6e-7 on [0, 0.25]; direct subtraction is well-conditioned above it.
+def _log1p_neg_stable(value):
+    # Preserve precision for the positive Gumbel tail without relying on a
+    # backend-specific libdevice log1p. The degree-8 series has absolute error
+    # below 6e-7 on [0, 0.25]; subtraction is well-conditioned elsewhere for
+    # the part of the distribution that can win the argmax.
     polynomial = 1.0 / 8.0
     polynomial = 1.0 / 7.0 + value * polynomial
     polynomial = 1.0 / 6.0 + value * polynomial
@@ -126,8 +119,8 @@ def _log1p_neg(value):
     polynomial = 1.0 + value * polynomial
     series = -value * polynomial
 
-    direct = tl.log(tl.maximum(1.0 - value, _FP32_UNIT_ROUNDOFF))
-    return tl.where(value < _LOG1P_NEG_SERIES_CUTOFF, series, direct)
+    direct = tl.log(tl.maximum(1.0 - value, 5.960464477539063e-08))
+    return tl.where(value < 0.25, series, direct)
 
 
 @triton.jit
@@ -190,9 +183,13 @@ def gumbel_block_argmax(
             gumbel_noise = -tl.log(-tl.log(u))
         else:
             u = murmur3_uniform32(seed, pos, block)
-            # Reflect the winning tail from u -> 1 to the denser fp32 region
-            # near u -> 0. _log1p_neg avoids cancellation after reflection.
-            gumbel_noise = -tl.log(-_log1p_neg(u))
+            # Draw the large-noise tail (which decides the argmax winner) from u -> 0,
+            # where fp32 has fine resolution, instead of u -> 1, where fp32 spacing is
+            # ~2**-24. The naive `-log(-log(u))` puts the winning tail at u -> 1,
+            # hard-capping the noise at ~16.6 and coarsely quantizing it; using
+            # `log1p(-u)` == `log(1 - u)` keeps the tail in the well-resolved region.
+            # Note `1 - u` would lose precision for small u, so `log1p` is required.
+            gumbel_noise = -tl.log(-_log1p_neg_stable(u))
 
         # Apply gumbel noise.
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
@@ -255,24 +252,6 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
-def _token_launch_ranges(
-    num_tokens: int,
-    num_blocks: int,
-) -> Iterator[tuple[int, int]]:
-    tokens_per_launch = max(1, MAX_TRITON_PROGRAMS_PER_LAUNCH // num_blocks)
-    for token_start in range(0, num_tokens, tokens_per_launch):
-        yield token_start, min(token_start + tokens_per_launch, num_tokens)
-
-
-def _reduce_block_argmax(
-    local_argmax: torch.Tensor,
-    local_max: torch.Tensor,
-) -> torch.Tensor:
-    # NOTE(woosuk): Use int64 for later indexing.
-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
-    return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
-
-
 def gumbel_sample(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     expanded_idx_mapping: torch.Tensor,  # [num_tokens]
@@ -290,7 +269,8 @@ def gumbel_sample(
     if output_processed_logits_col is not None:
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
-    num_blocks = triton.cdiv(vocab_size, GUMBEL_BLOCK_SIZE)
+    BLOCK_SIZE = 1024
+    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
     local_max_dtype = torch.float64 if use_fp64 else torch.float32
     local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
@@ -298,33 +278,27 @@ def gumbel_sample(
         output_processed_logits_col is not None
         and output_processed_logits_col.dim() > 0
     )
-    processed_logits_stride = 0
-    if output_processed_logits is not None:
-        processed_logits_stride = output_processed_logits.stride(0)
-    for token_start, token_end in _token_launch_ranges(num_tokens, num_blocks):
-        token_slice = slice(token_start, token_end)
-        processed_logits_col = output_processed_logits_col
-        if per_token_col:
-            assert output_processed_logits_col is not None
-            processed_logits_col = output_processed_logits_col[token_slice]
-        _gumbel_sample_kernel[(token_end - token_start, num_blocks)](
-            local_argmax[token_slice],
-            local_argmax.stride(0),
-            local_max[token_slice],
-            local_max.stride(0),
-            output_processed_logits,
-            processed_logits_stride,
-            processed_logits_col,
-            logits[token_slice],
-            logits.stride(0),
-            expanded_idx_mapping[token_slice],
-            seed,
-            pos[token_slice],
-            temperature,
-            vocab_size,
-            BLOCK_SIZE=GUMBEL_BLOCK_SIZE,
-            APPLY_TEMPERATURE=apply_temperature,
-            USE_FP64=use_fp64,
-            PER_TOKEN_COL=per_token_col,
-        )
-    return _reduce_block_argmax(local_argmax, local_max)
+    _gumbel_sample_kernel[(num_tokens, num_blocks)](
+        local_argmax,
+        local_argmax.stride(0),
+        local_max,
+        local_max.stride(0),
+        output_processed_logits,
+        output_processed_logits.stride(0) if output_processed_logits is not None else 0,
+        output_processed_logits_col,
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        seed,
+        pos,
+        temperature,
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        APPLY_TEMPERATURE=apply_temperature,
+        USE_FP64=use_fp64,
+        PER_TOKEN_COL=per_token_col,
+    )
+    # NOTE(woosuk): Use int64 for later indexing.
+    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+    return sampled
