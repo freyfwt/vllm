@@ -90,7 +90,9 @@ def murmur3_hash32(seed, pos, offset, domain: tl.constexpr = 0):
 @triton.jit
 def murmur3_uniform32(seed, pos, offset):
     random24 = murmur3_hash32(seed, pos, offset) >> 8
-    return (random24.to(tl.float32) + 0.5) * 5.960464477539063e-08
+    # random24 fits in signed int32. The intermediate cast also avoids a
+    # uint32-to-float conversion that is unsupported by Ascend BiShengIR.
+    return (random24.to(tl.int32).to(tl.float32) + 0.5) * 5.960464477539063e-08
 
 
 @triton.jit
