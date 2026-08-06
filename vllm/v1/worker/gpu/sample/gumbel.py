@@ -2,12 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import tl, tldevice, triton
-
-try:
-    from triton.language.extra.cann import libdevice as gumbel_libdevice
-except ImportError:
-    gumbel_libdevice = tldevice
+from vllm.triton_utils import tl, triton
 
 
 @triton.jit
@@ -107,6 +102,40 @@ def murmur3_uniform64(seed, pos, offset):
 
 
 @triton.jit
+def _log1p_neg_stable(value):
+    # Preserve precision for the positive Gumbel tail without relying on a
+    # backend-specific libdevice log1p. The degree-8 series has absolute error
+    # below 6e-7 on [0, 0.25]; subtraction is well-conditioned elsewhere for
+    # the part of the distribution that can win the argmax.
+    series = -value * (
+        1.0
+        + value
+        * (
+            0.5
+            + value
+            * (
+                0.3333333333333333
+                + value
+                * (
+                    0.25
+                    + value
+                    * (
+                        0.2
+                        + value
+                        * (
+                            0.16666666666666666
+                            + value * (0.14285714285714285 + value * 0.125)
+                        )
+                    )
+                )
+            )
+        )
+    )
+    direct = tl.log(tl.maximum(1.0 - value, 5.960464477539063e-08))
+    return tl.where(value < 0.25, series, direct)
+
+
+@triton.jit
 def gumbel_block_argmax(
     logits,
     block,
@@ -172,7 +201,7 @@ def gumbel_block_argmax(
             # hard-capping the noise at ~16.6 and coarsely quantizing it; using
             # `log1p(-u)` == `log(1 - u)` keeps the tail in the well-resolved region.
             # Note `1 - u` would lose precision for small u, so `log1p` is required.
-            gumbel_noise = -tl.log(-gumbel_libdevice.log1p(-u))
+            gumbel_noise = -tl.log(-_log1p_neg_stable(u))
 
         # Apply gumbel noise.
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
