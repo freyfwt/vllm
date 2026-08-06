@@ -8,9 +8,9 @@ from vllm.triton_utils import tl, triton
 
 GUMBEL_BLOCK_SIZE = 1024
 MAX_TRITON_PROGRAMS_PER_LAUNCH = 65_535
-_FP32_UNIT_ROUNDOFF = 2.0**-24
-_FP64_UNIT_ROUNDOFF = 2.0**-53
-_LOG1P_NEG_SERIES_CUTOFF = 0.25
+_FP32_UNIT_ROUNDOFF: tl.constexpr = 2.0**-24
+_FP64_UNIT_ROUNDOFF: tl.constexpr = 2.0**-53
+_LOG1P_NEG_SERIES_CUTOFF: tl.constexpr = 0.25
 
 
 @triton.jit
