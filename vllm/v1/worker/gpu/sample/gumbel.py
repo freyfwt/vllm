@@ -4,6 +4,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+MAX_TRITON_GRID_PROGRAMS = 65_535
+
 
 @triton.jit
 def _temperature_kernel(
@@ -292,26 +294,37 @@ def gumbel_sample(
         output_processed_logits_col is not None
         and output_processed_logits_col.dim() > 0
     )
-    _gumbel_sample_kernel[(num_tokens, num_blocks)](
-        local_argmax,
-        local_argmax.stride(0),
-        local_max,
-        local_max.stride(0),
-        output_processed_logits,
-        output_processed_logits.stride(0) if output_processed_logits is not None else 0,
-        output_processed_logits_col,
-        logits,
-        logits.stride(0),
-        expanded_idx_mapping,
-        seed,
-        pos,
-        temperature,
-        vocab_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-        APPLY_TEMPERATURE=apply_temperature,
-        USE_FP64=use_fp64,
-        PER_TOKEN_COL=per_token_col,
-    )
+    processed_logits_stride = 0
+    if output_processed_logits is not None:
+        processed_logits_stride = output_processed_logits.stride(0)
+    max_tokens_per_launch = max(1, MAX_TRITON_GRID_PROGRAMS // num_blocks)
+    for token_start in range(0, num_tokens, max_tokens_per_launch):
+        token_end = min(token_start + max_tokens_per_launch, num_tokens)
+        token_slice = slice(token_start, token_end)
+        processed_logits_col = output_processed_logits_col
+        if per_token_col:
+            assert output_processed_logits_col is not None
+            processed_logits_col = output_processed_logits_col[token_slice]
+        _gumbel_sample_kernel[(token_end - token_start, num_blocks)](
+            local_argmax[token_slice],
+            local_argmax.stride(0),
+            local_max[token_slice],
+            local_max.stride(0),
+            output_processed_logits,
+            processed_logits_stride,
+            processed_logits_col,
+            logits[token_slice],
+            logits.stride(0),
+            expanded_idx_mapping[token_slice],
+            seed,
+            pos[token_slice],
+            temperature,
+            vocab_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+            APPLY_TEMPERATURE=apply_temperature,
+            USE_FP64=use_fp64,
+            PER_TOKEN_COL=per_token_col,
+        )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
     sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
