@@ -2,16 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
-
-# Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
-# zero draws before the flipped Gumbel transform below.
-#
-# Triton requires globals accessed from `@triton.jit` functions to be wrapped
-# in `tl.constexpr(...)`. We can only do that when Triton is actually
-# available — on the CPU worker path `tl` is a placeholder whose `constexpr`
-# attribute is `None`, and `tl.constexpr(...)` would crash at import time.
-_TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+from vllm.triton_utils import tl, tldevice, triton
 
 
 @triton.jit
@@ -59,26 +50,55 @@ def apply_temperature(
 
 
 @triton.jit
-def tl_rand64(seed, offset, includes_zero: tl.constexpr):
-    lo, hi, _, _ = tl.randint4x(seed, offset)
-    lo = lo.to(tl.uint32, bitcast=True).to(tl.uint64)
-    hi = hi.to(tl.uint32, bitcast=True).to(tl.uint64)
-    r = (hi << 32) | lo
-
-    # 1 / 2**64
-    scale = 5.421010862427522170037e-20
-    u = r.to(tl.float64) * scale
-    if not includes_zero:
-        u = tl.maximum(u, 2.2250738585072014e-308)  # float64 tiny
-    return u
+def _murmur3_rotl32(value, shift: tl.constexpr):
+    return (value << shift) | (value >> (32 - shift))
 
 
 @triton.jit
-def tl_rand32(seed, offset, includes_zero: tl.constexpr):
-    u = tl.rand(seed, offset)
-    if not includes_zero:
-        u = tl.maximum(u, _TL_RAND_MIN)
-    return u
+def _murmur3_mix(h, key):
+    key *= 0xCC9E2D51
+    key = _murmur3_rotl32(key, 15)
+    key *= 0x1B873593
+    h ^= key
+    h = _murmur3_rotl32(h, 13)
+    return h * 5 + 0xE6546B64
+
+
+@triton.jit
+def _murmur3_fmix32(h):
+    h ^= h >> 16
+    h *= 0x85EBCA6B
+    h ^= h >> 13
+    h *= 0xC2B2AE35
+    return h ^ (h >> 16)
+
+
+@triton.jit
+def murmur3_hash32(seed, pos, offset, domain: tl.constexpr = 0):
+    seed = seed.to(tl.int64)
+    pos = pos.to(tl.int64)
+    offset = offset.to(tl.uint32)
+    h = offset ^ offset
+    h ^= domain
+    h = _murmur3_mix(h, (seed & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, ((seed >> 32) & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, (pos & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, offset)
+    return _murmur3_fmix32(h ^ 16)
+
+
+@triton.jit
+def murmur3_uniform32(seed, pos, offset):
+    random24 = murmur3_hash32(seed, pos, offset) >> 8
+    return (random24.to(tl.float32) + 0.5) * 5.960464477539063e-08
+
+
+@triton.jit
+def murmur3_uniform64(seed, pos, offset):
+    lo = murmur3_hash32(seed, pos, offset).to(tl.uint64)
+    hi = murmur3_hash32(seed, pos, offset, domain=0x9E3779B9).to(tl.uint64)
+    random53 = ((hi << 32) | lo) >> 11
+    return (random53.to(tl.float64) + 0.5) * 1.1102230246251565e-16
 
 
 @triton.jit
@@ -133,16 +153,14 @@ def gumbel_block_argmax(
     if USE_FP64:
         logits = logits.to(tl.float64)
     if temp != 0.0:
-        # Calculate the seed for gumbel noise.
         seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         pos = tl.load(pos_ptr + token_idx)
-        gumbel_seed = tl.randint(seed, pos)
 
         if USE_FP64:
-            u = tl_rand64(gumbel_seed, block, includes_zero=False)
+            u = murmur3_uniform64(seed, pos, block)
             gumbel_noise = -tl.log(-tl.log(u))
         else:
-            u = tl_rand32(gumbel_seed, block, includes_zero=False)
+            u = murmur3_uniform32(seed, pos, block)
             # Draw the large-noise tail (which decides the argmax winner) from u -> 0,
             # where fp32 has fine resolution, instead of u -> 1, where fp32 spacing is
             # ~2**-24. The naive `-log(-log(u))` puts the winning tail at u -> 1,
