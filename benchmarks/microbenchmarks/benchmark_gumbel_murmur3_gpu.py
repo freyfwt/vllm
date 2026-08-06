@@ -19,11 +19,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
-import vllm
-from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
-from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample as murmur3_sample
+import triton
+import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 BASELINE_COMMIT = "f5a8d73377d0f0a4e00cba172f9fbd0d50471b07"
 DEFAULT_SEED = 20_260_803
@@ -41,7 +39,7 @@ SUITE_SHAPES = (
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "gumbel_murmur3_gpu.json"
 
-_TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_TL_RAND_MIN: tl.constexpr = 4.6566127342e-10
 
 
 @triton.jit
@@ -216,22 +214,222 @@ def philox_sample(
     return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
 
 
-def _sample_murmur3(
+@triton.jit
+def _murmur3_rotl32(value, shift: tl.constexpr):
+    return (value << shift) | (value >> (32 - shift))
+
+
+@triton.jit
+def _murmur3_mix(h, key):
+    key *= 0xCC9E2D51
+    key = _murmur3_rotl32(key, 15)
+    key *= 0x1B873593
+    h ^= key
+    h = _murmur3_rotl32(h, 13)
+    return h * 5 + 0xE6546B64
+
+
+@triton.jit
+def _murmur3_fmix32(h):
+    h ^= h >> 16
+    h *= 0x85EBCA6B
+    h ^= h >> 13
+    h *= 0xC2B2AE35
+    return h ^ (h >> 16)
+
+
+@triton.jit
+def _murmur3_hash32(seed, pos, offset, domain: tl.constexpr = 0):
+    seed = seed.to(tl.int64)
+    pos = pos.to(tl.int64)
+    offset = offset.to(tl.uint32)
+    h = offset ^ offset
+    h ^= domain
+    h = _murmur3_mix(h, (seed & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, ((seed >> 32) & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, (pos & 0xFFFFFFFF).to(tl.uint32))
+    h = _murmur3_mix(h, offset)
+    return _murmur3_fmix32(h ^ 16)
+
+
+@triton.jit
+def _murmur3_uniform32(seed, pos, offset):
+    random24 = _murmur3_hash32(seed, pos, offset) >> 8
+    return (random24.to(tl.int32).to(tl.float32) + 0.5) * 5.960464477539063e-08
+
+
+@triton.jit
+def _murmur3_uniform64(seed, pos, offset):
+    lo = _murmur3_hash32(seed, pos, offset).to(tl.uint64)
+    hi = _murmur3_hash32(seed, pos, offset, domain=0x9E3779B9).to(tl.uint64)
+    random53 = ((hi << 32) | lo) >> 11
+    return (random53.to(tl.float64) + 0.5) * 1.1102230246251565e-16
+
+
+@triton.jit
+def _log1p_neg_stable(value):
+    polynomial = 1.0 / 8.0
+    polynomial = 1.0 / 7.0 + value * polynomial
+    polynomial = 1.0 / 6.0 + value * polynomial
+    polynomial = 1.0 / 5.0 + value * polynomial
+    polynomial = 1.0 / 4.0 + value * polynomial
+    polynomial = 1.0 / 3.0 + value * polynomial
+    polynomial = 1.0 / 2.0 + value * polynomial
+    polynomial = 1.0 + value * polynomial
+    series = -value * polynomial
+
+    direct = tl.log(tl.maximum(1.0 - value, 5.960464477539063e-08))
+    return tl.where(value < 0.25, series, direct)
+
+
+@triton.jit
+def _murmur3_block_argmax(
+    logits,
+    block,
+    mask,
+    token_idx,
+    expanded_idx_mapping_ptr,
+    temp_ptr,
+    seeds_ptr,
+    pos_ptr,
+    processed_logits_ptr,
+    processed_logits_stride,
+    processed_logits_col_ptr,
+    vocab_size,
+    APPLY_TEMPERATURE: tl.constexpr,
+    USE_FP64: tl.constexpr,
+    PER_TOKEN_COL: tl.constexpr = False,
+):
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
+    is_valid_req = req_state_idx >= 0
+    temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
+        tl.float32
+    )
+    if temp != 0.0 and APPLY_TEMPERATURE:
+        logits = logits / temp
+
+    if processed_logits_ptr is not None:
+        if processed_logits_col_ptr is not None:
+            if PER_TOKEN_COL:
+                col = tl.load(processed_logits_col_ptr + token_idx)
+            else:
+                col = tl.load(processed_logits_col_ptr)
+        else:
+            col = 0
+        tl.store(
+            processed_logits_ptr
+            + req_state_idx * processed_logits_stride
+            + col * vocab_size
+            + block,
+            logits,
+            mask=mask & is_valid_req,
+        )
+
+    if USE_FP64:
+        logits = logits.to(tl.float64)
+    if temp != 0.0:
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        pos = tl.load(pos_ptr + token_idx)
+
+        if USE_FP64:
+            uniform = _murmur3_uniform64(seed, pos, block)
+            noise = -tl.log(-tl.log(uniform))
+        else:
+            uniform = _murmur3_uniform32(seed, pos, block)
+            noise = -tl.log(-_log1p_neg_stable(uniform))
+        logits = tl.where(mask, logits + noise, float("-inf"))
+
+    return tl.max(logits, axis=0, return_indices=True)
+
+
+@triton.jit
+def _murmur3_sample_kernel(
+    local_argmax_ptr,
+    local_argmax_stride,
+    local_max_ptr,
+    local_max_stride,
+    processed_logits_ptr,
+    processed_logits_stride,
+    processed_logits_col_ptr,
+    logits_ptr,
+    logits_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    temp_ptr,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr,
+    USE_FP64: tl.constexpr,
+    PER_TOKEN_COL: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    logits = tl.load(
+        logits_ptr + token_idx * logits_stride + block,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float32)
+
+    value, idx = _murmur3_block_argmax(
+        logits,
+        block,
+        mask,
+        token_idx,
+        expanded_idx_mapping_ptr,
+        temp_ptr,
+        seeds_ptr,
+        pos_ptr,
+        processed_logits_ptr,
+        processed_logits_stride,
+        processed_logits_col_ptr,
+        vocab_size,
+        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+        USE_FP64=USE_FP64,
+        PER_TOKEN_COL=PER_TOKEN_COL,
+    )
+    token_id = block_idx * BLOCK_SIZE + idx
+    tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
+    tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+
+
+def murmur3_sample(
     logits: torch.Tensor,
-    mapping: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
     seed: torch.Tensor,
     pos: torch.Tensor,
 ) -> torch.Tensor:
-    return murmur3_sample(
+    expanded_idx_mapping = expanded_idx_mapping.contiguous()
+    pos = pos.contiguous()
+    num_tokens, vocab_size = logits.shape
+    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
+    local_max = logits.new_empty(num_tokens, num_blocks, dtype=torch.float32)
+    _murmur3_sample_kernel[(num_tokens, num_blocks)](
+        local_argmax,
+        local_argmax.stride(0),
+        local_max,
+        local_max.stride(0),
+        None,
+        0,
+        None,
         logits,
-        mapping,
-        temperature,
+        logits.stride(0),
+        expanded_idx_mapping,
         seed,
         pos,
-        apply_temperature=False,
-        use_fp64=False,
+        temperature,
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        APPLY_TEMPERATURE=False,
+        USE_FP64=False,
+        PER_TOKEN_COL=False,
     )
+    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+    return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
 
 
 Sampler = Callable[
@@ -240,7 +438,7 @@ Sampler = Callable[
 ]
 SAMPLERS: dict[str, Sampler] = {
     "philox": philox_sample,
-    "murmur3": _sample_murmur3,
+    "murmur3": murmur3_sample,
 }
 
 
@@ -439,7 +637,6 @@ def _write_results(
             "torch_version": torch.__version__,
             "cuda_runtime_version": torch.version.cuda,
             "triton_version": getattr(triton, "__version__", None),
-            "vllm_version": vllm.__version__,
         },
         "source": {
             "baseline": {
@@ -492,8 +689,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if not HAS_TRITON:
-        raise RuntimeError("Triton is required for this benchmark")
     if not torch.accelerator.is_available():
         raise RuntimeError("A CUDA-capable NVIDIA GPU is required")
     if torch.accelerator.current_accelerator().type != "cuda":
@@ -506,7 +701,7 @@ def main() -> None:
 
     torch.accelerator.set_device_index(args.device)
     device = torch.device(f"cuda:{args.device}")
-    set_random_seed(DEFAULT_SEED)
+    torch.manual_seed(DEFAULT_SEED)
     print(
         f"device={torch.cuda.get_device_name(device)} "
         f"warmups={args.warmups} rounds={args.rounds}"
