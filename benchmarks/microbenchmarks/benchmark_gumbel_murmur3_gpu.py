@@ -39,7 +39,7 @@ SUITE_SHAPES = (
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "gumbel_murmur3_gpu.json"
 
-_TL_RAND_MIN: tl.constexpr = 4.6566127342e-10
+_TL_RAND_MIN = tl.constexpr(4.6566127342e-10)
 
 
 @triton.jit
