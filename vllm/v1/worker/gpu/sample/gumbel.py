@@ -4,6 +4,11 @@ import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 
+try:
+    from triton.language.extra.cann import libdevice as gumbel_libdevice
+except ImportError:
+    gumbel_libdevice = tldevice
+
 
 @triton.jit
 def _temperature_kernel(
@@ -167,7 +172,7 @@ def gumbel_block_argmax(
             # hard-capping the noise at ~16.6 and coarsely quantizing it; using
             # `log1p(-u)` == `log(1 - u)` keeps the tail in the well-resolved region.
             # Note `1 - u` would lose precision for small u, so `log1p` is required.
-            gumbel_noise = -tl.log(-tldevice.log1p(-u))
+            gumbel_noise = -tl.log(-gumbel_libdevice.log1p(-u))
 
         # Apply gumbel noise.
         logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
