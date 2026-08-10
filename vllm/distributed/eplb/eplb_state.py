@@ -776,7 +776,10 @@ class EplbState:
                 src=expert_load_window,
             )
 
-            global_expert_load_window = logical_expert_load_window.sum(dim=0)
+            if getattr(self.policy, "uses_expert_load_time_series", False):
+                global_expert_load_window = logical_expert_load_window
+            else:
+                global_expert_load_window = logical_expert_load_window.sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
