@@ -997,8 +997,9 @@ class EplbState:
                 # host, so the load window and current map have to come back.
                 with gpu_sync_allowed():
                     new_physical_to_logical_map = self.policy.rebalance_experts(
+                        global_expert_load_window.cpu(),
                         EplbStats(
-                            global_expert_load_window=global_expert_load_window.cpu(),
+                            global_expert_load_window=global_expert_load_window,
                             num_replicas=num_replicas,
                             num_groups=num_groups,
                             num_nodes=num_nodes,

@@ -39,14 +39,18 @@ class AbstractEplbPolicy(ABC):
     @abstractmethod
     def rebalance_experts(
         self,
+        weight: torch.Tensor,
         stats: EplbStats,
         old_global_expert_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Entry point for expert-parallelism load balancer.
 
         Args:
-            stats: Load and topology snapshot. The load tensor is on CPU;
-                policy-specific subclasses may provide additional inputs.
+            weight: CPU load tensor from the same snapshot as `stats`.
+                Built-in policies use `[layers, num_logical_experts]`.
+            stats: Published load/topology snapshot. Policy-specific subclasses
+                may provide additional inputs. Use `weight` for computation;
+                the snapshot's source tensor may remain on the device.
             old_global_expert_indices: [layers, num_replicas], the old global
                 expert indices. Used to avoid unnecessary weight copying
                 for experts moving within one rank.
