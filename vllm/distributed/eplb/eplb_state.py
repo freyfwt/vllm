@@ -54,7 +54,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_utils import CpuGpuEvent
-from .policy import EPLB_POLICIES, AbstractEplbPolicy
+from .policy import EPLB_POLICIES, AbstractEplbPolicy, EplbStats
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     move_from_buffer,
@@ -70,32 +70,6 @@ def _compute_eplb_load_stats(
     avg_tokens = num_tokens_per_rank.mean(dim=1).sum()
     max_tokens = num_tokens_per_rank.max(dim=1).values.sum()
     return avg_tokens, max_tokens
-
-
-@dataclass
-class EplbStats:
-    """Model stats used in EPLB rebalancing algorithm."""
-
-    global_expert_load_window: torch.Tensor
-    """
-    Aggregate logical-expert loads, shape (num_moe_layers, num_logical_experts).
-    """
-    num_replicas: int
-    """
-    Number of physical experts.
-    """
-    num_groups: int
-    """
-    Number of expert groups.
-    """
-    num_nodes: int
-    """
-    Number of nodes.
-    """
-    num_gpus: int
-    """
-    Number of GPUs.
-    """
 
 
 @dataclass
@@ -484,30 +458,10 @@ class EplbState:
             group_coordinator, backend, model.expert_weights, expert_buffer
         )
 
-    def create_policy(self) -> type[AbstractEplbPolicy] | AbstractEplbPolicy:
+    def create_policy(self) -> AbstractEplbPolicy:
         """Create the policy shared by every model in this EPLB state."""
         policy = self.parallel_config.eplb_config.policy
-        return EPLB_POLICIES["default" if policy is None else policy]
-
-    def rebalance_experts(
-        self,
-        model_state: EplbModelState,
-        weight: torch.Tensor,
-        num_replicas: int,
-        num_groups: int,
-        num_nodes: int,
-        num_ranks: int,
-        old_global_expert_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Plan a model's placement through the existing policy interface."""
-        return self.policy.rebalance_experts(
-            weight,
-            num_replicas,
-            num_groups,
-            num_nodes,
-            num_ranks,
-            old_global_expert_indices,
-        )
+        return EPLB_POLICIES["default" if policy is None else policy]()
 
     def add_model(
         self,
@@ -1042,13 +996,14 @@ class EplbState:
                 # Get new expert mappings for the model. The policy runs on the
                 # host, so the load window and current map have to come back.
                 with gpu_sync_allowed():
-                    new_physical_to_logical_map = self.rebalance_experts(
-                        eplb_model_state,
-                        global_expert_load_window.cpu(),
-                        num_replicas,
-                        num_groups,
-                        num_nodes,
-                        num_gpus,
+                    new_physical_to_logical_map = self.policy.rebalance_experts(
+                        EplbStats(
+                            global_expert_load_window=global_expert_load_window.cpu(),
+                            num_replicas=num_replicas,
+                            num_groups=num_groups,
+                            num_nodes=num_nodes,
+                            num_gpus=num_gpus,
+                        ),
                         eplb_model_state.physical_to_logical_map.cpu(),
                     )
 
