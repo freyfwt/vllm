@@ -187,6 +187,10 @@ speculative decoding; the count setting is ignored without a speculative MoE
 draft. See the
 [EPLB deployment guide](../../serving/expert_parallel_deployment.md#multimodel-eplb-with-speculative-decoding).
 
+With PCP-enabled targets, DSpark runs draft attention without PCP while its
+MoE layers retain the physical expert-parallel topology. Target EPLB and
+redundant experts are preserved when `draft_enable_eplb` is `false`.
+
 !!! note
     Gemma 4 assistant checkpoints are handled as Gemma 4 MTP speculators, not
     as generic draft models. Use `"method": "mtp"` with the assistant

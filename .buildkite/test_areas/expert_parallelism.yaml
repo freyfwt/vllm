@@ -84,8 +84,14 @@ steps:
   - vllm/model_executor/model_loader/ep_weight_filter.py
   - vllm/distributed/eplb
   - tests/model_executor/model_loader/test_ep_weight_filter_eplb.py
+  - tests/distributed/test_eplb_spec_decode.py
+  - vllm/v1/worker/gpu/spec_decode/
+  - vllm/config/attention.py
+  - vllm/v1/attention/selector.py
+  - vllm/model_executor/layers/attention/mla_attention.py
   commands:
   - pytest -v -s model_executor/model_loader/test_ep_weight_filter_eplb.py
+  - pytest -v -s distributed/test_eplb_spec_decode.py -k test_dspark_pcp_only_eplb
   mirror:
     amd:
       label: ":amd: (MI355) EP Weight Filter with EPLB"
@@ -102,6 +108,8 @@ steps:
       - vllm/distributed/eplb
       - tests/model_executor/model_loader/test_ep_weight_filter_eplb.py
       - vllm/platforms/rocm.py
+      commands:
+      - pytest -v -s model_executor/model_loader/test_ep_weight_filter_eplb.py
 
 - label: ":nvidia: (H100) [Nightly] Elastic EP Scaling"
   key: elastic-ep-scaling-test

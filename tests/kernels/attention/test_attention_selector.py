@@ -46,6 +46,25 @@ def clear_cache():
     _cached_get_attn_backend.cache_clear()
 
 
+def test_attention_pcp_override_has_separate_selection_cache():
+    """Replicated drafts must not reuse a target's PCP backend selection."""
+    for use_pcp in (True, False):
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                prefill_context_parallel_size=2,
+                distributed_executor_backend="mp",
+            ),
+            attention_config=AttentionConfig(_use_pcp=use_pcp),
+        )
+        with (
+            set_current_vllm_config(config),
+            patch("vllm.platforms.current_platform", CpuPlatform()),
+        ):
+            assert get_attn_backend(64, torch.float32, "auto").get_name() == "CPU_ATTN"
+        assert config.parallel_config.prefill_context_parallel_size == 2
+    assert _cached_get_attn_backend.cache_info().misses == 2
+
+
 # Define MLA and non-MLA backends separately
 DEVICE_MLA_BACKENDS = {
     "cuda": [

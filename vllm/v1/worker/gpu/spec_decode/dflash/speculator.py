@@ -40,15 +40,8 @@ class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        parallel_config = vllm_config.parallel_config
         speculative_config = vllm_config.speculative_config
         assert speculative_config is not None
-        vllm_config = copy.copy(vllm_config)
-        vllm_config.parallel_config = replace(
-            parallel_config,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=speculative_config.draft_decode_context_parallel_size,
-        )
         super().__init__(vllm_config, device)
 
         # See SpeculativeConfig.prefill_context_kv_only.
@@ -138,12 +131,15 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        # Attention sees the replicated draft execution, not the MoE topology.
         config = super().attn_vllm_config
         config.attention_config = replace(
             config.attention_config,
             use_non_causal=self.requires_non_causal,
+            _use_pcp=False,
         )
+        config.parallel_config = copy.copy(config.parallel_config)
+        config.parallel_config.prefill_context_parallel_size = 1
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:

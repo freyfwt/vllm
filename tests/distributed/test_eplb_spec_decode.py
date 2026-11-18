@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tests.utils import large_gpu_mark
+from tests.v1.e2e.spec_decode.utils import compute_acceptance_rate
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
@@ -311,6 +312,42 @@ def test_eplb_spec_decode(
         measured_value - RTOL < expected_gsm8k_value
         and measured_value + RTOL > expected_gsm8k_value
     ), f"Expected: {expected_gsm8k_value} |  Measured: {measured_value}"
+
+
+@large_gpu_mark(min_gb=80)
+@pytest.mark.parametrize("draft_enable_eplb", [False, True])
+def test_dspark_pcp_only_eplb(vllm_runner, draft_enable_eplb):
+    """PCP-only EP must serve accepted drafts with target EPLB enabled."""
+    from vllm import SamplingParams
+
+    with vllm_runner(
+        "deepseek-ai/DeepSeek-V4-Flash-DSpark",
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config={
+            "num_redundant_experts": 2,
+            "window_size": 4,
+            "step_interval": 8,
+        },
+        speculative_config={
+            "method": "dspark",
+            "num_speculative_tokens": 7,
+            "draft_enable_eplb": draft_enable_eplb,
+        },
+        max_model_len=512,
+        max_num_seqs=2,
+        max_num_batched_tokens=512,
+        enforce_eager=True,
+        disable_log_stats=False,
+    ) as runner:
+        outputs = runner.llm.generate(
+            ["Explain why the sky is blue.", "What is 12 multiplied by 13?"],
+            SamplingParams(temperature=0, max_tokens=64, ignore_eos=True),
+        )
+        assert all(len(output.outputs[0].token_ids) == 64 for output in outputs)
+        assert compute_acceptance_rate(runner.llm.get_metrics()) > 0
 
 
 @large_gpu_mark(min_gb=80)

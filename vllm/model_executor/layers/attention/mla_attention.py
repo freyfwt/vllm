@@ -666,7 +666,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_pcp = (
+            vllm_config.attention_config._use_pcp
+            and parallel_config.prefill_context_parallel_size > 1
+        )
         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -2547,7 +2550,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.compilation_config = vllm_config.compilation_config
         self.vllm_config = vllm_config
         self.device = device
-        self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self.use_pcp = (
+            vllm_config.attention_config._use_pcp
+            and parallel_config.prefill_context_parallel_size > 1
+        )
         # Per builder: a KV group can mix target and draft layers.
         ctx = self.compilation_config.static_forward_context
         self.non_causal_multi_token_decode = any(

@@ -6,9 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import Qwen3Config, Qwen3MoeConfig
 
 from tests.v1.core.utils import full_layer
-from vllm.config import ParallelConfig
+from vllm.config import (
+    CompilationConfig,
+    EPLBConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.gpu import model_runner
@@ -106,40 +115,74 @@ def test_dspark_parallel_config_can_disable_draft_eplb():
     assert target_config.eplb_config.num_redundant_experts == 32
 
 
-@pytest.mark.parametrize("pcp_size", [1, 4])
-@pytest.mark.parametrize("dcp_size", [1, 4])
-@pytest.mark.parametrize("use_mla", [False, True])
+@pytest.mark.parametrize(
+    "tp_size,pcp_size,dcp_size,enable_eplb",
+    [(4, 1, 1, False), (4, 1, 4, False), (4, 4, 4, False), (1, 4, 1, True)],
+)
 def test_draft_context_parallelism_without_changing_target(
-    monkeypatch, pcp_size, dcp_size, use_mla
+    tmp_path, tp_size, pcp_size, dcp_size, enable_eplb
 ):
+    """Replicated draft attention must preserve the physical MoE topology."""
+    hf_kwargs = dict(
+        vocab_size=128,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        mask_token_id=0,
+    )
+    hf_config = Qwen3MoeConfig(
+        **hf_kwargs,
+        num_experts=16,
+        num_experts_per_tok=2,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+    hf_config.save_pretrained(tmp_path)
+    target_model = ModelConfig(
+        str(tmp_path), skip_tokenizer_init=True, max_model_len=128
+    )
+    hf_config = Qwen3Config(**hf_kwargs, architectures=["DFlashDraftModel"])
+    hf_config.save_pretrained(tmp_path / "draft")
     target_parallel = ParallelConfig(
-        tensor_parallel_size=4,
+        tensor_parallel_size=tp_size,
         prefill_context_parallel_size=pcp_size,
         decode_context_parallel_size=dcp_size,
         cp_kv_cache_interleave_size=16,
         distributed_executor_backend="mp",
+        enable_expert_parallel=enable_eplb,
+        enable_eplb=enable_eplb,
+        eplb_config=EPLBConfig(num_redundant_experts=4 if enable_eplb else 0),
     )
-    target_config = SimpleNamespace(
+    target_config = VllmConfig(
+        model_config=target_model,
         parallel_config=target_parallel,
-        speculative_config=SimpleNamespace(
-            draft_decode_context_parallel_size=dcp_size if use_mla else 1
+        speculative_config=SpeculativeConfig(
+            method="dflash",
+            model=str(tmp_path / "draft"),
+            num_speculative_tokens=2,
+            target_model_config=target_model,
+            target_parallel_config=target_parallel,
         ),
+        scheduler_config=SchedulerConfig(
+            max_model_len=128,
+            is_encoder_decoder=False,
+            max_num_seqs=2,
+            max_num_batched_tokens=128,
+        ),
+        compilation_config=CompilationConfig(mode=0),
     )
-
-    class CapturedConfig(Exception):
-        pass
-
-    def capture_init(self, config, device):
-        raise CapturedConfig(config)
-
-    monkeypatch.setattr(DraftModelSpeculator, "__init__", capture_init)
-    with pytest.raises(CapturedConfig) as captured:
-        DFlashSpeculator(target_config, device=None)
-    draft_parallel = captured.value.args[0].parallel_config
-    assert draft_parallel.tensor_parallel_size == 4
-    assert draft_parallel.prefill_context_parallel_size == 1
-    assert draft_parallel.decode_context_parallel_size == (dcp_size if use_mla else 1)
+    draft = DFlashSpeculator(target_config, device=torch.device("cpu"))
+    draft_parallel = draft.vllm_config.parallel_config
+    assert draft_parallel.tensor_parallel_size == tp_size
+    assert draft_parallel.prefill_context_parallel_size == pcp_size
+    assert draft_parallel.decode_context_parallel_size == 1
     assert draft_parallel.cp_kv_cache_interleave_size == 16
+    assert draft_parallel.enable_eplb == enable_eplb
+    assert draft_parallel.eplb_config is target_parallel.eplb_config
+    assert draft.attn_vllm_config.parallel_config.prefill_context_parallel_size == 1
+    assert not draft.attn_vllm_config.attention_config._use_pcp
     assert target_parallel.prefill_context_parallel_size == pcp_size
     assert target_parallel.decode_context_parallel_size == dcp_size
     assert target_parallel.cp_kv_cache_interleave_size == 16
