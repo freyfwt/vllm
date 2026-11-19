@@ -9,18 +9,23 @@ steps:
   device: h200_18gb
   working_dir: "/vllm-workspace/tests"
   source_file_dependencies:
+  - vllm/config/eplb.py
   - vllm/distributed/eplb
   - tests/distributed/test_eplb_algo.py
   - tests/distributed/test_eplb_migration_scheduler.py
+  - tests/distributed/test_eplb_stair.py
   - tests/distributed/test_eplb_utils.py
   - tests/distributed/test_eplb_extension_hooks.py
   - vllm/config/parallel.py
   - vllm/platforms/interface.py
+  - vllm/v1/worker/gpu/eplb_utils.py
+  - vllm/v1/worker/gpu/model_runner.py
   commands:
   - pytest -v -s distributed/test_eplb_algo.py
   - pytest -v -s distributed/test_eplb_migration_scheduler.py
+  - pytest -v -s distributed/test_eplb_stair.py
   - pytest -v -s distributed/test_eplb_utils.py
-  - pytest -v -s distributed/test_eplb_extension_hooks.py
+  - pytest -v -s distributed/test_eplb_extension_hooks.py -m 'not cpu_test and not distributed'
   mirror:
     amd:
       automatic_shard: true
@@ -31,12 +36,16 @@ steps:
       depends_on:
       - image-build-amd
       source_file_dependencies:
+      - vllm/config/eplb.py
       - vllm/distributed/eplb
       - tests/distributed/test_eplb_algo.py
+      - tests/distributed/test_eplb_stair.py
       - tests/distributed/test_eplb_utils.py
       - tests/distributed/test_eplb_extension_hooks.py
       - vllm/config/parallel.py
       - vllm/platforms/interface.py
+      - vllm/v1/worker/gpu/eplb_utils.py
+      - vllm/v1/worker/gpu/model_runner.py
       - vllm/platforms/rocm.py
 
 - label: ":nvidia: (L4) [Nightly] EPLB Execution"
@@ -50,10 +59,13 @@ steps:
   num_devices: 4
   source_file_dependencies:
   - vllm/distributed/eplb
+  - vllm/v1/worker/gpu_worker.py
   - tests/distributed/test_eplb_execute.py
+  - tests/distributed/test_eplb_extension_hooks.py
   commands:
   - pytest -v -s distributed/test_eplb_execute.py
   - pytest -v -s distributed/test_eplb_spec_decode.py
+  - pytest -v -s distributed/test_eplb_extension_hooks.py -m distributed
   mirror:
     amd:
       automatic_shard: true
@@ -67,7 +79,9 @@ steps:
       - image-build-amd
       source_file_dependencies:
       - vllm/distributed/eplb
+      - vllm/v1/worker/gpu_worker.py
       - tests/distributed/test_eplb_execute.py
+      - tests/distributed/test_eplb_extension_hooks.py
       - tests/distributed/test_eplb_spec_decode.py
       - vllm/platforms/rocm.py
 

@@ -14,6 +14,7 @@ from pydantic import Field, field_validator, model_validator
 from torch.distributed import ProcessGroup, ReduceOp, Store
 
 import vllm.envs as envs
+from vllm.config.eplb import StairConfig
 from vllm.config.fault_tolerance import FaultToleranceConfig
 from vllm.config.utils import CompileFactors, config, get_compile_factors
 from vllm.distributed.utils import cpu_all_reduce_
@@ -44,7 +45,7 @@ def get_min_num_redundant_experts(num_logical_experts: int, ep_size: int) -> int
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-EPLBPolicyOption = Literal["default"]
+EPLBPolicyOption = Literal["default", "stair"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 DBOSchedule = Literal["dispatch-combine-overlap", "all-reduce-overlap"]
 EPLBCommunicatorBackend = Literal[
@@ -208,6 +209,11 @@ class EPLBConfig:
     """
     Interval for logging the balancedness.
     """
+    load_collection_phase: Literal["all", "prefill", "decode"] = "all"
+    """Collect expert load from all batches, batches containing prefill, or
+    decode-only batches. Mixed batches count as prefill. Target and draft models
+    use the target batch's phase.
+    """
     use_async: bool = True
     """
     Whether to use non-blocking EPLB.
@@ -217,6 +223,8 @@ class EPLBConfig:
     """Built-in or platform-defined policy name. None selects the platform default
     ("default" on built-in platforms). Validated by the platform.
     """
+    stair_config: StairConfig = Field(default_factory=StairConfig)
+    """CPU search, risk, hysteresis and transfer limits for the STAIR policy."""
 
     communicator: EPLBCommunicatorBackend | str | None = None
     """

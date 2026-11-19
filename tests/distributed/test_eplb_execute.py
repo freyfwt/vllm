@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,89 @@ from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.platforms import current_platform
 
 from .eplb_utils import distributed_run, set_env_vars_and_device
+
+
+@pytest.mark.parametrize("policy", ["default", "stair"])
+def test_async_eplb_worker_stops_before_model_teardown(
+    tmp_path,
+    vllm_runner,
+    enable_pickle,
+    policy,
+):
+    """Worker shutdown must not leave EPLB accessing released model resources."""
+    from transformers import Qwen3MoeConfig
+
+    from vllm import SamplingParams
+
+    def worker_lifecycle(worker) -> tuple[bool, bool, bool]:
+        state = worker.model_runner.eplb_state
+        planner = getattr(state.policy, "_process", None)
+        return (
+            hasattr(worker.model_runner, "model"),
+            state.async_worker is not None and state.async_worker.is_alive(),
+            planner is not None and planner.poll() is None,
+        )
+
+    Qwen3MoeConfig(
+        architectures=["Qwen3MoeForCausalLM"],
+        num_hidden_layers=2,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_experts=8,
+        num_experts_per_tok=2,
+        vocab_size=1024,
+        max_position_embeddings=128,
+    ).save_pretrained(tmp_path)
+
+    with vllm_runner(
+        str(tmp_path),
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        tensor_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=True,
+        eplb_config={
+            "use_async": True,
+            "policy": policy,
+            "step_interval": 4 if policy == "stair" else 1000,
+            "window_size": 4,
+        },
+        kernel_config={"moe_backend": "triton", "enable_jit_warmup": False},
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_seqs=1,
+        kv_cache_memory_bytes=16 * 1024 * 1024,
+    ) as runner:
+        outputs = runner.llm.generate(
+            [{"prompt_token_ids": [10, 20, 30]}],
+            SamplingParams(
+                temperature=0,
+                max_tokens=8,
+                ignore_eos=True,
+                detokenize=False,
+            ),
+            use_tqdm=False,
+        )
+        assert len(outputs[0].outputs[0].token_ids) == 8
+        deadline = monotonic() + 30
+        expected = [(True, True, policy == "stair")] * 2
+        while True:
+            observed = runner.llm.collective_rpc(worker_lifecycle, timeout=30)
+            if observed == expected:
+                break
+            assert monotonic() < deadline, observed
+
+        runner.llm.collective_rpc("shutdown", timeout=30)
+
+        assert (
+            runner.llm.collective_rpc(worker_lifecycle, timeout=30)
+            == [(False, False, False)] * 2
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e8m0fnu, torch.float4_e2m1fn_x2])

@@ -265,9 +265,12 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `window_size` | Number of engine steps to track for rebalancing decisions | 1000 |
 | `step_interval` | Frequency of rebalancing (every N engine steps) | 3000 |
 | `log_balancedness` | Log balancedness metrics (avg tokens per expert ÷ max tokens per expert) | `false` |
+| `load_collection_phase` | Collect load from `"all"`, `"prefill"`, or `"decode"` target batches | `"all"` |
 | `num_redundant_experts` | Additional experts needed to make the total divisible by EP size; computed when unset | `auto` |
 | `draft_num_redundant_experts` | Redundant expert count for a speculative MoE draft; inherits a valid target count for matching routed expert counts, otherwise computed when unset. Invalid explicit values fail validation with a suggested minimum when possible. Ignored without a speculative MoE draft. | `auto` |
 | `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
+| `policy` | Placement policy: `"default"` or `"stair"` on built-in platforms | `"default"` |
+| `stair_config` | STAIR window compression, search budgets, hysteresis, and transfer limits | See `StairConfig` |
 | `policy` | The policy type for expert parallel load balancing | `"default"` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`, `"symm_mem"`, or `null` (auto) | `null` |
 
@@ -278,6 +281,8 @@ vllm serve Qwen/Qwen3-30B-A3B \
   --enable-eplb \
   --eplb-config '{"window_size":1000,"step_interval":3000,"num_redundant_experts":2,"log_balancedness":true}'
 ```
+
+To balance experts using decode load, add `"load_collection_phase":"decode"` to `--eplb-config`. A batch containing any prefill request, including a mixed prefill/decode batch, belongs to the prefill phase. Decode collection includes only batches without prefill requests. Draft-model forwards inherit the target batch's phase, and DBO microbatches share that phase. Filtering affects load collection only: every rank continues stepping EPLB and participating in rearrangement collectives, including ranks whose local batch is excluded. Excluded batches contribute zero load to slots where the existing sampling schedule would record a batch. Filtering does not pause the rearrangement interval.
 
 ??? tip "Prefer individual arguments instead of JSON?"
 
@@ -299,6 +304,57 @@ vllm serve <target-moe-model> \
   --eplb-config '{"num_redundant_experts":2,"draft_num_redundant_experts":2}' \
   --speculative-config '{"method":"draft_model","model":"<draft-moe-model>","num_speculative_tokens":5}'
 ```
+
+### STAIR CPU Placement Planner
+
+`StairPlanner` plans expert placement from a chronological window of logical-expert token counts. Call it directly for CPU placement analysis:
+
+```python
+import numpy as np
+
+from vllm.distributed.eplb.policy.stair import StairConfig, StairPlanner
+
+loads = np.array([[[8, 7, 6, 5]]])  # [steps, layers, logical_experts]
+current = np.array([[[0, 1], [2, 3]]])  # [layers, ranks, slots]
+node_ids = np.array([0, 1])  # one node ID per rank
+config = StairConfig()
+plan = StairPlanner.plan_rebalance(
+    loads,
+    current,
+    np.array([np.nan]),  # last committed mean imbalance per layer
+    node_ids,
+    config,
+)
+StairPlanner.validate_plan(
+    current,
+    plan,
+    loads.shape[-1],
+    node_ids,
+    config.rank_transfer_limit,
+    config.cross_node_transfer_limit,
+)
+assert plan.rank_expert_ids.tolist() == [[[0, 3], [2, 1]]]
+```
+
+Every rank must have equal slot capacity, each logical expert must be present, and a rank cannot hold two copies of the same expert. The planner uses weighted temporal statistics and covariance to search replica counts and placements. `StairConfig` controls compression, search budgets, hysteresis, and incoming/outgoing transfer limits. Both transfer limits default to `-1` (unlimited); setting `cross_node_transfer_limit=0` prevents transfers between nodes.
+
+Search uses up to `load_window_bins=64` chronological bins. Acceptance, hysteresis, and reported mean/p95 imbalance use the original steps, so bin averaging cannot hide a mean or p95 regression over the raw window. Callers supplying pre-binned sums through `sample_counts` receive checks at the supplied resolution and must retain raw steps when they need the full-window guarantee.
+
+`rank_expert_ids`, `source_rank_ids`, and `source_slot_ids` have shape `[layers, ranks, slots]`. Each source coordinate refers to the current placement and owns the corresponding target expert. Unchanged layers retain their original slots and have a NaN `predicted_mean_ratios` value. Save a changed layer's predicted mean ratio as the next hysteresis anchor only after its weights and routing maps have committed.
+
+To use STAIR while serving, select `"policy":"stair"` in the EPLB configuration. The default policy remains `"default"`.
+
+```bash
+vllm serve <moe-model> \
+  --tensor-parallel-size 2 \
+  --enable-expert-parallel \
+  --enable-eplb \
+  --eplb-config '{"policy":"stair","stair_config":{"load_window_bins":64,"cross_node_transfer_limit":0}}'
+```
+
+STAIR collects a shared chronological load window, excluding dummy iterations and batches outside `load_collection_phase`. A real zero-load sample remains part of the window. CPU planning runs in persistent subprocesses with layers divided across the current EPLB rank group. Each accepted placement carries exact transfer sources, and its hysteresis history is updated only after the weights and routing maps commit.
+
+STAIR requires fixed expert-parallel membership. Elastic expert parallelism and fault-tolerant recovery are rejected during configuration. The planner subprocesses close after the EPLB transfer worker stops; synchronous EPLB also closes them during shutdown.
 
 ### Expert Distribution Formula
 

@@ -18,6 +18,7 @@ from vllm.distributed.eplb.migration_scheduler import (
     MigrationFlow,
     schedule_migration_batches,
 )
+from vllm.distributed.eplb.transfer_plan import ExpertTransferPlan
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -64,6 +65,9 @@ class AsyncEplbLayerResult:
     thread calls record() after it finishes transferring weights out of the intermediate
     buffer in _move_to_workspace()
     """
+
+    predicted_mean_ratio: float | None = None
+    """Predicted imbalance to persist only after this layer is committed."""
 
 
 def get_ep_ranks_with_experts_batch(
@@ -316,6 +320,7 @@ def move_to_buffer(
     layer_idx: int = 0,
     enable_migration_batching: bool = False,
     migration_batches: list[list[MigrationFlow]] | None = None,
+    source_rank_ids: np.ndarray | None = None,
 ) -> TransferMetadata:
     """Rearranges expert weights during EPLB rebalancing.
 
@@ -334,6 +339,7 @@ def move_to_buffer(
         enable_migration_batching: Schedule remote transfers in batches where
             each rank communicates with at most one peer.
         migration_batches: Optional batches precomputed for this layer.
+        source_rank_ids: Exact sources from a validated explicit plan.
 
     Returns:
         TransferMetadata: Metadata needed for completing remote weight transfers.
@@ -404,7 +410,16 @@ def move_to_buffer(
     )
 
     # Migration batching is disabled by default and must be explicitly enabled.
-    if enable_migration_batching:
+    if enable_migration_batching or source_rank_ids is not None:
+        if source_rank_ids is not None:
+            # Rebuild from the exact sources instead of an inferred-source cache.
+            migration_batches = schedule_migration_batches(
+                num_local_experts, old_indices, new_indices, source_rank_ids
+            )
+            if not enable_migration_batching:
+                migration_batches = [
+                    [flow for batch in migration_batches for flow in batch]
+                ]
         _execute_migration_batches(
             num_local_experts=num_local_experts,
             old_indices=old_indices,
@@ -618,6 +633,7 @@ def transfer_layer(
     layer_idx: int = 0,
     enable_migration_batching: bool = False,
     migration_batches: list[list[MigrationFlow]] | None = None,
+    transfer_plan: ExpertTransferPlan | None = None,
 ) -> TransferMetadata:
     """Rearranges the expert weights in place according to the new expert indices.
 
@@ -642,6 +658,9 @@ def transfer_layer(
         enable_migration_batching: Schedule remote transfers in batches where
             each rank communicates with at most one peer.
         migration_batches: Optional batches precomputed for this layer.
+        transfer_plan: Fixed-capacity placement with exact sources. Validate the
+            full plan against the old full-model map before calling this
+            per-layer entry point.
 
     Returns:
         TransferMetadata: Metadata needed for completing remote weight transfers,
@@ -649,6 +668,18 @@ def transfer_layer(
 
     """
     ep_size = ep_group.size()
+    if transfer_plan is not None:
+        if rank_mapping is not None:
+            raise ValueError(
+                "Explicit EPLB transfer plans do not support elastic rank remapping"
+            )
+        transfer_plan.validate(old_layer_indices, layer_idx)
+        if transfer_plan.source_rank_ids.shape[1] != ep_size:
+            raise ValueError("Explicit EPLB sources do not match the EP group")
+        if not torch.equal(
+            new_layer_indices, transfer_plan.physical_to_logical_map[layer_idx]
+        ):
+            raise ValueError("Explicit EPLB target does not match the layer transfer")
     if rank_mapping is not None:
         # Add a layer dimension for compatibility with mapping functions
         old_layer_indices_2d = old_layer_indices.unsqueeze(0)
@@ -693,6 +724,11 @@ def transfer_layer(
         layer_idx=layer_idx,
         enable_migration_batching=enable_migration_batching,
         migration_batches=migration_batches,
+        source_rank_ids=(
+            transfer_plan.source_rank_ids[layer_idx]
+            if transfer_plan is not None
+            else None
+        ),
     )
 
 
@@ -705,6 +741,7 @@ def rearrange_expert_weights_inplace(
     communicator: EplbCommunicator,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
+    transfer_plan: ExpertTransferPlan | None = None,
 ) -> None:
     """Rearranges the expert weights in place according to the new expert indices.
 
@@ -726,8 +763,23 @@ def rearrange_expert_weights_inplace(
             This is used during profile run, where we only perform dummy
             communications to reserve enough memory for the buffers.
         rank_mapping: A dictionary mapping old rank to new rank.
+        transfer_plan: Fixed-capacity placement with exact expert sources.
 
     """
+    if transfer_plan is not None:
+        if rank_mapping is not None:
+            raise ValueError(
+                "Explicit EPLB transfer plans do not support elastic rank remapping"
+            )
+        with gpu_sync_allowed():
+            old_global_expert_indices = old_global_expert_indices.cpu()
+            transfer_plan.validate(old_global_expert_indices)
+        if transfer_plan.source_rank_ids.shape[1] != ep_group.size():
+            raise ValueError("Explicit EPLB sources do not match the EP group")
+        if not torch.equal(
+            new_global_expert_indices, transfer_plan.physical_to_logical_map
+        ):
+            raise ValueError("Explicit EPLB target does not match the rearrangement")
     if rank_mapping is not None:
         if len(rank_mapping) == ep_group.size():
             # scale down
@@ -795,6 +847,11 @@ def rearrange_expert_weights_inplace(
             ep_rank=ep_rank,
             communicator=communicator,
             layer_idx=layer_idx,
+            source_rank_ids=(
+                transfer_plan.source_rank_ids[layer_idx]
+                if transfer_plan is not None
+                else None
+            ),
         )
 
         move_from_buffer(

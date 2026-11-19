@@ -112,6 +112,26 @@ Every plugin has three parts:
 
     An `EplbState` subclass can implement `create_policy()` and `create_model_communicator()`. `create_policy()` returns one `AbstractEplbPolicy` instance shared by the models in that state. Device-specific expert mapping and load recording belong to a registered router subclass overriding `_apply_eplb_mapping()`; the router retains ownership of its layer state. Synchronous, profiling and asynchronous planning call `policy.rebalance_experts(stats, old_global_expert_indices)` directly. Asynchronous planning runs on the background worker thread; synchronous planning and profiling run on the main thread. `EplbStats` holds one load/topology snapshot; downstream policies can accept dataclass subclasses carrying additional planning inputs. Before calling the policy, the worker replaces the snapshot's load field with its CPU copy on the worker stream. This preserves the stats instance, its subclass and any additional fields. The default policy consumes aggregate CPU loads of shape `[layers, experts]` and returns a CPU integer placement tensor. Keep policy configuration on the policy instance and per-model, per-round inputs in the snapshot. Set `EplbState.model_state_cls` to an `EplbModelState` subclass to customize model-local commits. `_commit_eplb_maps()` installs a full-model placement and `_commit_eplb_maps_for_layer()` installs one layer. `_move_to_workspace()` consumes that model's pending transfer result; commit overrides must submit device-specific updates before returning so buffer acknowledgement remains after weight installation and map updates.
 
+    A policy that constrains migration sources can return an `ExpertTransferPlan` instead of the placement tensor. Its CPU map has shape `[layers, physical_experts]`; its NumPy source-rank and source-slot arrays have shape `[layers, ranks, slots]` and index the old placement. The runtime validates the full plan before executing transfers. Callers using `transfer_layer()` directly must first validate the entire plan against the old full-model map; the layer-level check cannot replace this validation. Plans require a dense, fixed-capacity layout with no repeated expert within a rank, and retain locally available experts in their original slots. Elastic rank remapping is unsupported. Tensor-returning policies keep the existing source selection.
+
+    ```python
+    import numpy as np
+    import torch
+
+    from vllm.distributed.eplb.transfer_plan import ExpertTransferPlan
+
+    old = torch.tensor([[0, 1, 2, 3]])
+    plan = ExpertTransferPlan(
+        physical_to_logical_map=torch.tensor([[0, 2, 1, 3]]),
+        source_rank_ids=np.array([[[0, 1], [0, 1]]]),
+        source_slot_ids=np.array([[[0, 0], [1, 1]]]),
+        predicted_mean_ratios=np.array([1.05]),
+    )
+    plan.validate(old)
+    ```
+
+    Optional `predicted_mean_ratios` describe the mean max-to-average rank load for each changed layer; unchanged layers use NaN. `EplbModelState.last_committed_mean_ratios` updates only after weight installation and map commits succeed, before workspace acknowledgement. Discarding an async result during drain does not update this history. Policies read history through a per-model stats snapshot rather than keeping it on the shared policy instance.
+
 4. Implement the worker class `MyDummyWorker` in `my_dummy_worker.py`. The worker class should inherit from [WorkerBase][vllm.v1.worker.worker_base.WorkerBase]. Please follow the interface to implement the functions one by one. Basically, all interfaces in the base class should be implemented, since they are called here and there in vLLM. To make sure a model can be executed, the basic functions should be implemented are:
 
     - `init_device`: This function is called to set up the device for the worker.

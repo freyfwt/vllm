@@ -4,7 +4,10 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+
+from vllm.distributed.eplb.transfer_plan import ExpertTransferPlan
 
 
 @dataclass(slots=True)
@@ -36,13 +39,31 @@ class EplbStats:
     """
 
 
+@dataclass(slots=True)
+class TemporalEplbStats(EplbStats):
+    """Chronological `[steps, layers, experts]` loads on a shared rank clock."""
+
+    sample_counts: tuple[int, ...]
+    """Number of original iterations represented by each sample."""
+    rank_node_ids: tuple[int, ...]
+    """Node ordinals in the same rank order as the placement."""
+    last_committed_mean_ratios: np.ndarray
+    """Per-layer committed predictions, copied before planning starts."""
+
+
 class AbstractEplbPolicy(ABC):
+    requires_temporal_load: bool = False
+
+    def close(self) -> None:
+        """Idempotently release resources after calls into the policy have stopped."""
+        return None
+
     @abstractmethod
     def rebalance_experts(
         self,
         stats: EplbStats,
         old_global_expert_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | ExpertTransferPlan:
         """Entry point for expert-parallelism load balancer.
 
         Args:
@@ -55,7 +76,8 @@ class AbstractEplbPolicy(ABC):
 
         Returns:
             physical_to_logical_map: [layers, num_replicas], the expert
-                index of each replica, on CPU.
+                index of each replica, on CPU. Policies requiring exact copy
+                sources may return an `ExpertTransferPlan` instead.
 
         """
         raise NotImplementedError
