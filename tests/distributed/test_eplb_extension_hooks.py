@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from contextlib import closing
 from dataclasses import dataclass
 
 import pytest
@@ -25,6 +27,7 @@ from vllm.distributed.eplb.eplb_state import (
 )
 from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
 from vllm.distributed.eplb.policy import DefaultEplbPolicy
+from vllm.distributed.eplb.policy_process import EplbPolicyProcess
 from vllm.distributed.eplb.rebalance_execute import AsyncEplbLayerResult, transfer_layer
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.platforms import current_platform
@@ -251,13 +254,16 @@ def model_state(cpu_group):
 
 @pytest.mark.parametrize("use_async", [False, True])
 def test_policy_receives_extended_stats_without_losing_inputs(model_state, use_async):
+    """Custom inputs survive direct calls and async subprocess planning."""
+    worker_pid = os.getpid()
+
     @dataclass
     class Stats(EplbStats):
         metadata: tuple[int, ...] = ()
 
     class Policy(DefaultEplbPolicy):
         def rebalance_experts(self, stats, old_global_expert_indices=None):
-            assert stats is published_stats
+            assert (os.getpid() != worker_pid) is use_async
             assert isinstance(stats, Stats)
             assert stats.metadata == (3, 7)
             assert stats.global_expert_load_window.device.type == "cpu"
@@ -273,7 +279,8 @@ def test_policy_receives_extended_stats_without_losing_inputs(model_state, use_a
     state = _State(Policy())
     if use_async:
         model_state.eplb_stats = published_stats
-        result = run_rebalance_experts(model_state, state, current, None)
+        with closing(EplbPolicyProcess(state.policy)) as state.policy_process:
+            result = run_rebalance_experts(model_state, state, current, None)
     else:
         result = state.policy.rebalance_experts(published_stats, current)
     default_state = EplbState(ParallelConfig(), torch.device("cpu"))

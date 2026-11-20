@@ -55,6 +55,7 @@ from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, EplbStats
+from .policy_process import EplbPolicyProcess
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     copy_rows,
@@ -331,6 +332,7 @@ class EplbState:
         """
         Selected EPLB algorithm
         """
+        self.policy_process: EplbPolicyProcess | None = None
         self.expert_load_window_step: int = 0
         """
         Current step in the sliding window.
@@ -440,8 +442,8 @@ class EplbState:
     def create_policy(self) -> AbstractEplbPolicy:
         """Create the policy shared by every model in this EPLB state.
 
-        `rebalance_experts` runs on the background worker thread for asynchronous
-        planning and on the main thread for synchronous planning and profiling.
+        Async planning runs a serialized copy in a persistent CPU subprocess.
+        Synchronous planning and profiling use this instance on the main thread.
         """
         policy = self.parallel_config.eplb_config.policy
         return EPLB_POLICIES["default" if policy is None else policy]()
