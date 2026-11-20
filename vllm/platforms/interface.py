@@ -1335,6 +1335,10 @@ class Platform:
             eplb_config.policy = "default"
         if eplb_config.policy not in get_args(EPLBPolicyOption):
             raise ValueError(f"Unknown EPLB policy: {eplb_config.policy}")
+        if eplb_config.policy == "stair" and parallel_config.enable_elastic_ep:
+            raise ValueError("STAIR EPLB requires fixed expert-parallel membership")
+        if eplb_config.policy == "stair" and parallel_config.enable_fault_tolerance:
+            raise ValueError("STAIR EPLB does not support fault-tolerant recovery")
         if eplb_config.communicator is None:
             # Prefer NIXL when available: zero-copy RDMA reads, compatible
             # with both async EPLB and elastic EP.

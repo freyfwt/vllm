@@ -14,6 +14,7 @@ import cloudpickle
 import torch
 
 from .policy import AbstractEplbPolicy, EplbStats
+from .transfer_plan import ExpertTransferPlan
 
 
 class EplbPolicyProcessError(RuntimeError):
@@ -41,6 +42,8 @@ class EplbPolicyProcess:
         self._connection, child = Pipe()
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(sys.path)
+        env["VLLM_PLUGINS"] = ""
+        env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
             env[name] = "1"
         try:
@@ -82,7 +85,7 @@ class EplbPolicyProcess:
         self,
         stats: EplbStats,
         old_global_expert_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | ExpertTransferPlan:
         """Return the CPU placement for this immutable planning snapshot."""
         try:
             self._connection.send_bytes(
@@ -108,7 +111,12 @@ def _main(fd: int) -> None:
             while True:
                 stats, old_map = cloudpickle.loads(connection.recv_bytes())
                 result = policy.rebalance_experts(stats, old_map)
-                if result.device.type != "cpu":
+                placement = (
+                    result.physical_to_logical_map
+                    if isinstance(result, ExpertTransferPlan)
+                    else result
+                )
+                if placement.device.type != "cpu":
                     raise ValueError("EPLB policy must return a CPU tensor")
                 connection.send_bytes(cloudpickle.dumps((result, None)))
         except (EOFError, BrokenPipeError):

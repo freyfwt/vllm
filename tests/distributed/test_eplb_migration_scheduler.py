@@ -2,19 +2,33 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
+from dataclasses import replace
+from datetime import timedelta
 
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from vllm.config.parallel import EPLBConfig
-from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
+from vllm.distributed.eplb.eplb_communicator import (
+    EplbCommunicator,
+    TorchDistNcclEplbCommunicator,
+)
 from vllm.distributed.eplb.migration_scheduler import (
     MigrationFlow,
     schedule_migration_batches,
     schedule_migration_batches_for_layers,
 )
-from vllm.distributed.eplb.rebalance_execute import move_from_buffer, move_to_buffer
+from vllm.distributed.eplb.rebalance_execute import (
+    move_from_buffer,
+    move_to_buffer,
+    rearrange_expert_weights_inplace,
+    transfer_layer,
+)
+from vllm.distributed.eplb.transfer_plan import ExpertTransferPlan
+from vllm.utils.network_utils import get_open_port
 
 
 class _MockEplbCommunicator(EplbCommunicator):
@@ -407,3 +421,156 @@ def test_move_from_buffer_cuda_matches_per_row_copies(seed: int) -> None:
         )
     for w, cw in zip(weights, cuda_weights):
         assert torch.equal(w, cw.cpu())
+
+
+def _explicit_source_plan():
+    old = torch.tensor([[0, 1, 0, 2, 3, 4]])
+    plan = ExpertTransferPlan(
+        physical_to_logical_map=torch.tensor([[0, 3, 1, 2, 0, 4]]),
+        source_rank_ids=np.array([[[0, 2], [0, 1], [1, 2]]]),
+        source_slot_ids=np.array([[[0, 0], [1, 1], [0, 1]]]),
+        predicted_mean_ratios=np.array([1.1]),
+    )
+    return old, plan
+
+
+def test_explicit_sources_override_the_replica_balancing_heuristic():
+    old, plan = _explicit_source_plan()
+    plan.validate(old)
+    batches = schedule_migration_batches(
+        2,
+        old[0].numpy(),
+        plan.physical_to_logical_map[0].numpy(),
+        plan.source_rank_ids[0],
+    )
+    assert set(_flatten_transfers(batches)) == {(2, 0, 3), (0, 1, 1), (1, 2, 0)}
+    for batch in batches:
+        _assert_no_endpoint_conflict(batch)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["source", "local_source", "local_slot", "duplicates", "coverage", "ratio"],
+)
+def test_explicit_plan_rejects_unsupported_or_inconsistent_sources(invalid):
+    old, plan = _explicit_source_plan()
+    if invalid == "source":
+        plan.source_slot_ids[0, 2, 0] = 1
+        message = "does not own"
+    elif invalid == "local_source":
+        plan.source_rank_ids[0, 0, 0] = 1
+        message = "retain local"
+    elif invalid == "local_slot":
+        plan.physical_to_logical_map[0, :2] = torch.tensor([3, 0])
+        plan.source_rank_ids[0, 0] = [2, 0]
+        plan.source_slot_ids[0, 0] = [0, 0]
+        message = "retain local"
+    elif invalid == "duplicates":
+        plan.physical_to_logical_map[0, 4:] = torch.tensor([0, 0])
+        message = "duplicate"
+    elif invalid == "coverage":
+        plan.physical_to_logical_map[0, 1] = 2
+        plan.source_rank_ids[0, 0, 1] = 1
+        plan.source_slot_ids[0, 0, 1] = 1
+        message = "coverage"
+    else:
+        plan = replace(plan, predicted_mean_ratios=np.array([np.nan]))
+        message = "finite for changed"
+    with pytest.raises(ValueError, match=message):
+        plan.validate(old)
+
+
+def _explicit_source_transfer_worker(rank, world_size, port):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        group = dist.group.WORLD
+        communicator = TorchDistNcclEplbCommunicator(group)
+        old, plan = _explicit_source_plan()
+        plan.validate(old)
+        original = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+        # Replica contents deliberately differ, proving which exact source copied.
+        expected = original[
+            (plan.source_rank_ids[0, rank] * 2 + plan.source_slot_ids[0, rank])
+        ]
+        for batching in (False, True):
+            weights = [original[rank * 2 : rank * 2 + 2].clone()]
+            buffer = [torch.empty_like(weights[0])]
+            original_ptr = weights[0].data_ptr()
+            transfer = transfer_layer(
+                old[0],
+                plan.physical_to_logical_map[0],
+                weights,
+                buffer,
+                group,
+                communicator,
+                enable_migration_batching=batching,
+                transfer_plan=plan,
+            )
+            torch.testing.assert_close(
+                weights[0], original[rank * 2 : rank * 2 + 2], rtol=0, atol=0
+            )
+            move_from_buffer(
+                weights, buffer, transfer, plan.physical_to_logical_map[0].numpy(), rank
+            )
+            torch.testing.assert_close(weights[0], expected, rtol=0, atol=0)
+            assert weights[0].data_ptr() == original_ptr
+        # An invalid later layer must fail before even the first layer is copied.
+        source_slots = np.repeat(plan.source_slot_ids, 2, axis=0)
+        source_slots[1, 2, 0] = 1
+        invalid = ExpertTransferPlan(
+            physical_to_logical_map=plan.physical_to_logical_map.repeat(2, 1),
+            source_rank_ids=np.repeat(plan.source_rank_ids, 2, axis=0),
+            source_slot_ids=source_slots,
+        )
+        untouched = [[original[rank * 2 : rank * 2 + 2].clone()] for _ in range(2)]
+        with pytest.raises(ValueError, match="does not own"):
+            rearrange_expert_weights_inplace(
+                old.repeat(2, 1),
+                invalid.physical_to_logical_map,
+                untouched,
+                [torch.empty_like(untouched[0][0])],
+                group,
+                communicator,
+                transfer_plan=invalid,
+            )
+        for layer in untouched:
+            torch.testing.assert_close(
+                layer[0], original[rank * 2 : rank * 2 + 2], rtol=0, atol=0
+            )
+        weights = [[original[rank * 2 : rank * 2 + 2].clone()]]
+        rearrange_expert_weights_inplace(
+            old,
+            plan.physical_to_logical_map,
+            weights,
+            [torch.empty_like(weights[0][0])],
+            group,
+            communicator,
+            transfer_plan=plan,
+        )
+        torch.testing.assert_close(weights[0][0], expected, rtol=0, atol=0)
+        with pytest.raises(ValueError, match="elastic rank remapping"):
+            transfer_layer(
+                old[0],
+                plan.physical_to_logical_map[0],
+                weights[0],
+                [torch.empty_like(weights[0][0])],
+                group,
+                communicator,
+                rank_mapping={0: 0, 1: 1, 2: 2},
+                transfer_plan=plan,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_explicit_sources_stage_then_commit_exact_rows_over_gloo():
+    """Real rank transfers honor the chosen replica without overwriting live weights."""
+    mp.spawn(
+        _explicit_source_transfer_worker, args=(3, get_open_port()), nprocs=3, join=True
+    )

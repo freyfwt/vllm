@@ -15,6 +15,7 @@ from .eplb_utils import CpuGpuEvent, device_stream
 from .migration_scheduler import schedule_migration_batches_for_layers
 from .policy_process import EplbPolicyProcess, EplbPolicyProcessError
 from .rebalance_execute import AsyncEplbLayerResult, transfer_layer
+from .transfer_plan import ExpertTransferPlan
 
 if TYPE_CHECKING:
     from .eplb_state import EplbModelState, EplbState
@@ -49,6 +50,7 @@ def start_async_worker(
         finally:
             if state.policy_process is not None:
                 state.policy_process.close()
+            state.policy.close()
 
     thread = threading.Thread(target=thread_target, daemon=True)
     thread.start()
@@ -60,7 +62,7 @@ def run_rebalance_experts(
     eplb_state: "EplbState",
     physical_to_logical_map_cpu: torch.Tensor,
     stream: torch.Stream,
-) -> torch.Tensor:
+) -> torch.Tensor | ExpertTransferPlan:
     assert model_state.eplb_stats is not None
     eplb_stats = model_state.eplb_stats
 
@@ -70,14 +72,15 @@ def run_rebalance_experts(
             eplb_stats.global_expert_load_window.cpu()
         )
     # Compute new expert mappings for the model
-    policy = eplb_state.policy_process or eplb_state.policy
-    new_physical_to_logical_map = policy.rebalance_experts(
+    result = eplb_state.rebalance_experts(
         eplb_stats,
         physical_to_logical_map_cpu,
     )
-    assert new_physical_to_logical_map.device == torch.device("cpu")
-
-    return new_physical_to_logical_map
+    if isinstance(result, ExpertTransferPlan):
+        result.validate(physical_to_logical_map_cpu)
+    else:
+        assert result.device == torch.device("cpu")
+    return result
 
 
 def transfer_run_periodically(
@@ -89,6 +92,8 @@ def transfer_run_periodically(
     while True:
         try:
             state.rearrange_event.wait(stream=stream)
+            if state.async_worker_stop.is_set():
+                return
             _transfer_cycle(state, stream, is_profile)
         except Exception as exc:
             if isinstance(exc, EplbPolicyProcessError) or not (
@@ -118,6 +123,8 @@ def _transfer_cycle(
 
     assert state.is_async
     for model_state in state.model_states.values():
+        if not model_state.rebalanced:
+            continue
         layer_idx = 0
         # Set the async worker's CUDA stream on the communicator
         model_state.communicator.set_stream(stream)
@@ -129,14 +136,24 @@ def _transfer_cycle(
             physical_to_logical_map_cpu = model_state.physical_to_logical_map.cpu()
 
         t_start = time.perf_counter()
-        new_physical_to_logical_map = run_rebalance_experts(
+        result = run_rebalance_experts(
             model_state, state, physical_to_logical_map_cpu, stream
         )
         if state.ft_reset_epoch != reset_epoch:
             return
+        transfer_plan = result if isinstance(result, ExpertTransferPlan) else None
+        new_physical_to_logical_map = (
+            transfer_plan.physical_to_logical_map
+            if transfer_plan is not None
+            else result
+        )
+        assert isinstance(new_physical_to_logical_map, torch.Tensor)
 
         migration_batches_by_layer = None
-        if state.parallel_config.eplb_config.migration_batching_enabled:
+        if (
+            state.parallel_config.eplb_config.migration_batching_enabled
+            and transfer_plan is None
+        ):
             profile_name = "eplb: schedule migration batches"
             num_local_experts = model_state.model.expert_weights[0][0].shape[0]
             # The placement snapshots stay fixed for this rebalance cycle.
@@ -186,6 +203,7 @@ def _transfer_cycle(
                 is_profile=is_profile,
                 stream=stream,
                 layer_idx=layer_idx,
+                transfer_plan=transfer_plan,
                 enable_migration_batching=(
                     state.parallel_config.eplb_config.migration_batching_enabled
                 ),
@@ -212,6 +230,12 @@ def _transfer_cycle(
                 new_physical_to_logical_map=new_physical_to_logical_map[layer_idx],
                 transfer_metadata=transfer_metadata,
                 consumed_event=consumed_event,
+                predicted_mean_ratio=(
+                    float(transfer_plan.predicted_mean_ratios[layer_idx])
+                    if transfer_plan is not None
+                    and transfer_plan.predicted_mean_ratios is not None
+                    else None
+                ),
             )
             model_state.worker_progress = 2 * layer_idx + 1
             # A fault recovery happened during the transfer, so the main
