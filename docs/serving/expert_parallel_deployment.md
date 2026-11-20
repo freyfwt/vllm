@@ -268,11 +268,12 @@ Configure EPLB with the `--eplb-config` argument, which accepts a JSON string. T
 | `load_collection_phase` | Collect load from `"all"`, `"prefill"`, or `"decode"` target batches | `"all"` |
 | `num_redundant_experts` | Additional experts needed to make the total divisible by EP size; computed when unset | `auto` |
 | `draft_num_redundant_experts` | Redundant expert count for a speculative MoE draft; inherits a valid target count for matching routed expert counts, otherwise computed when unset. Invalid explicit values fail validation with a suggested minimum when possible. Ignored without a speculative MoE draft. | `auto` |
-| `use_async` | Use non-blocking EPLB for reduced latency overhead | `true` |
+| `use_async` | Use non-blocking EPLB with policy computation in a persistent CPU subprocess per worker | `true` |
 | `policy` | Placement policy: `"default"` or `"stair"` on built-in platforms | `"default"` |
 | `stair_config` | STAIR window compression, search budgets, hysteresis, and transfer limits | See `StairConfig` |
-| `policy` | The policy type for expert parallel load balancing | `"default"` |
 | `communicator` | Backend for expert weight transfers: `"torch_nccl"`, `"torch_gloo"`, `"pynccl"`, `"nixl"`, `"symm_mem"`, or `null` (auto) | `null` |
+
+Async EPLB (`"use_async": true`, the default) uses the shared policy subprocess automatically. Policies receive serializable CPU snapshots and return CPU placements or explicit transfer plans. Synchronous planning runs in the worker; profiling keeps its original in-process path. Planning errors, child death, and timeouts fail the async worker.
 
 For example:
 
@@ -352,9 +353,9 @@ vllm serve <moe-model> \
   --eplb-config '{"policy":"stair","stair_config":{"load_window_bins":64,"cross_node_transfer_limit":0}}'
 ```
 
-STAIR collects a shared chronological load window, excluding dummy iterations and batches outside `load_collection_phase`. A real zero-load sample remains part of the window. CPU planning runs in persistent subprocesses with layers divided across the current EPLB rank group. Each accepted placement carries exact transfer sources, and its hysteresis history is updated only after the weights and routing maps commit.
+STAIR collects a shared chronological load window, excluding dummy iterations and batches outside `load_collection_phase`. A real zero-load sample remains part of the window. The EPLB runtime divides layers across the current EPLB rank group before dispatching local snapshots to the shared async policy subprocess. STAIR itself uses only its inputs and configuration; it does not access process groups or launch another process. Synchronous EPLB computes local shards in the worker, while profiling uses the default policy without starting a planner. Each accepted placement carries exact transfer sources, and its hysteresis history is updated only after the weights and routing maps commit.
 
-STAIR requires fixed expert-parallel membership. Elastic expert parallelism and fault-tolerant recovery are rejected during configuration. The planner subprocesses close after the EPLB transfer worker stops; synchronous EPLB also closes them during shutdown.
+STAIR requires fixed expert-parallel membership. Elastic expert parallelism and fault-tolerant recovery are rejected during configuration. The shared policy subprocess closes after the EPLB transfer worker stops. Planner errors are terminal, matching the shared async execution contract.
 
 ### Expert Distribution Formula
 

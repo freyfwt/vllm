@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -63,6 +63,7 @@ from .policy import (
     StairEplbPolicy,
     TemporalEplbStats,
 )
+from .policy_process import EplbPolicyProcess
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     copy_rows,
@@ -368,6 +369,7 @@ class EplbState:
         """
         Selected EPLB algorithm
         """
+        self.policy_process: EplbPolicyProcess | None = None
         self.expert_load_window_step: int = 0
         """
         Current step in the sliding window.
@@ -482,8 +484,8 @@ class EplbState:
     def create_policy(self) -> AbstractEplbPolicy:
         """Create the policy shared by every model in this EPLB state.
 
-        `rebalance_experts` runs on the background worker thread for asynchronous
-        planning and on the main thread for synchronous planning and profiling.
+        Async planning runs a serialized copy in the shared CPU subprocess.
+        Policies receive explicit snapshots and do not access worker process groups.
         """
         policy = self.parallel_config.eplb_config.policy
         if policy == "stair":
@@ -493,6 +495,99 @@ class EplbState:
                 raise ValueError("STAIR EPLB does not support fault-tolerant recovery")
             return StairEplbPolicy(self.parallel_config.eplb_config.stair_config)
         return EPLB_POLICIES["default" if policy is None else policy]()
+
+    def rebalance_experts(
+        self, stats: EplbStats, old_map: torch.Tensor
+    ) -> torch.Tensor | ExpertTransferPlan:
+        """Run planning, keeping layer sharding and collectives in the worker."""
+        policy = self.policy_process or self.policy
+        if not self.policy.shard_by_layer:
+            return policy.rebalance_experts(stats, old_map)
+        if not isinstance(stats, TemporalEplbStats):
+            raise ValueError("Layer-sharded planning requires temporal statistics")
+        group = get_eplb_group().cpu_group
+        if group.size() != stats.num_gpus:
+            raise ValueError("Planning group does not match the placement topology")
+        num_layers = old_map.shape[0]
+        local_error: Exception | None = None
+        try:
+            owned = torch.arange(group.rank(), num_layers, group.size())
+            if owned.numel():
+                # Index before IPC so tensor serialization cannot send the full window.
+                local = policy.rebalance_experts(
+                    replace(
+                        stats,
+                        global_expert_load_window=stats.global_expert_load_window[
+                            :, owned
+                        ],
+                        last_committed_mean_ratios=stats.last_committed_mean_ratios[
+                            owned.numpy()
+                        ],
+                    ),
+                    old_map[owned],
+                )
+                if not isinstance(local, ExpertTransferPlan):
+                    raise ValueError("Layer-sharded policy must return a transfer plan")
+                local.validate(old_map[owned])
+                if local.predicted_mean_ratios is None:
+                    raise ValueError("Layer-sharded plan must include predicted ratios")
+                integers = torch.stack(
+                    (
+                        local.physical_to_logical_map.reshape(
+                            owned.numel(), stats.num_gpus, -1
+                        ),
+                        torch.from_numpy(local.source_rank_ids),
+                        torch.from_numpy(local.source_slot_ids),
+                    ),
+                    dim=1,
+                )
+                ratios = torch.from_numpy(local.predicted_mean_ratios)
+            else:
+                integers = torch.empty(
+                    (0, 3, stats.num_gpus, stats.num_replicas // stats.num_gpus),
+                    dtype=torch.int64,
+                )
+                ratios = torch.empty(0, dtype=torch.float64)
+        except Exception as error:
+            local_error = error
+        succeeded = torch.tensor(local_error is None, dtype=torch.int32)
+        torch.distributed.all_reduce(
+            succeeded, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        if not succeeded.item():
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("Layer planning failed on another EPLB rank")
+        integers = self._gather_layer_shard(integers, num_layers, group)
+        ratios = self._gather_layer_shard(ratios, num_layers, group)
+        result = ExpertTransferPlan(
+            physical_to_logical_map=integers[:, 0]
+            .reshape(old_map.shape)
+            .to(old_map.dtype),
+            source_rank_ids=integers[:, 1].numpy(),
+            source_slot_ids=integers[:, 2].numpy(),
+            predicted_mean_ratios=ratios.numpy(),
+        )
+        result.validate(old_map)
+        return result
+
+    @staticmethod
+    def _gather_layer_shard(
+        local_values: torch.Tensor, num_layers: int, group: ProcessGroup
+    ) -> torch.Tensor:
+        if group.size() == 1:
+            return local_values.clone()
+        capacity = (num_layers + group.size() - 1) // group.size()
+        padded = local_values.new_zeros((capacity, *local_values.shape[1:]))
+        padded[: local_values.shape[0]].copy_(local_values)
+        shards = [torch.empty_like(padded) for _ in range(group.size())]
+        torch.distributed.all_gather(shards, padded, group=group)
+        merged = local_values.new_empty((num_layers, *local_values.shape[1:]))
+        for owner, shard in enumerate(shards):
+            merged[owner :: group.size()].copy_(
+                shard[: len(merged[owner :: group.size()])]
+            )
+        return merged
 
     def add_model(
         self,
@@ -1144,7 +1239,12 @@ class EplbState:
                         eplb_model_state.physical_to_logical_map.cpu()
                     )
                 stats.global_expert_load_window = load_window_cpu
-                planning_result = planning_policy.rebalance_experts(
+                rebalance = (
+                    planning_policy.rebalance_experts
+                    if is_profile
+                    else self.rebalance_experts
+                )
+                planning_result = rebalance(
                     stats,
                     old_physical_to_logical_map,
                 )
@@ -1353,6 +1453,8 @@ class EplbState:
             self.rearrange_event.record()
             self.async_worker.join()
             self.async_worker = None
+        if self.policy_process is not None:
+            self.policy_process.close()
         self.policy.close()
 
     def drain_async(self) -> None:

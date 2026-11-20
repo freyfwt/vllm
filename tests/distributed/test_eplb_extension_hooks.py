@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+from contextlib import closing
 from dataclasses import dataclass
 
 import numpy as np
+import psutil
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -30,6 +33,10 @@ from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
 from vllm.distributed.eplb.policy import DefaultEplbPolicy, TemporalEplbStats
 from vllm.distributed.eplb.policy.stair import StairConfig, StairPlanner
 from vllm.distributed.eplb.policy.stair.runtime import StairEplbPolicy
+from vllm.distributed.eplb.policy_process import (
+    EplbPolicyProcess,
+    EplbPolicyProcessError,
+)
 from vllm.distributed.eplb.rebalance_execute import AsyncEplbLayerResult, transfer_layer
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.platforms import current_platform
@@ -267,13 +274,15 @@ def model_state(cpu_group):
 
 @pytest.mark.parametrize("use_async", [False, True])
 def test_policy_receives_extended_stats_without_losing_inputs(model_state, use_async):
+    worker_pid = os.getpid()
+
     @dataclass
     class Stats(EplbStats):
         metadata: tuple[int, ...] = ()
 
     class Policy(DefaultEplbPolicy):
         def rebalance_experts(self, stats, old_global_expert_indices=None):
-            assert stats is published_stats
+            assert (os.getpid() != worker_pid) is use_async
             assert isinstance(stats, Stats)
             assert stats.metadata == (3, 7)
             assert stats.global_expert_load_window.device.type == "cpu"
@@ -289,7 +298,8 @@ def test_policy_receives_extended_stats_without_losing_inputs(model_state, use_a
     state = _State(Policy())
     if use_async:
         model_state.eplb_stats = published_stats
-        result = run_rebalance_experts(model_state, state, current, None)
+        with closing(EplbPolicyProcess(state.policy)) as state.policy_process:
+            result = run_rebalance_experts(model_state, state, current, None)
     else:
         result = state.policy.rebalance_experts(published_stats, current)
     default_state = EplbState(ParallelConfig(), torch.device("cpu"))
@@ -490,59 +500,55 @@ def test_temporal_reduction_aligns_rank_and_model_specific_activity(tmp_path):
     mp.spawn(_temporal_load_worker, args=(2, str(tmp_path)), nprocs=2, join=True)
 
 
-def test_stair_subprocess_preserves_plans_and_reports_errors(cpu_group):
-    """Real IPC preserves the CPU result and propagates planner input errors."""
+def test_stair_shared_subprocess_needs_no_inference_process_group():
+    """A fresh interpreter plans explicit topology without worker globals."""
     loads = np.tile([[[11, 11, 10, 8], [11, 11, 10, 8]]], (4, 1, 1))
     current = np.array([[[0, 1], [2, 3]]] * 2)
     history = np.full(2, np.nan)
     nodes = np.array([0, 0])
     config = StairConfig(load_window_bins=2)
-    expected = StairPlanner.plan_rebalance(loads, current, history, nodes, config)
-    policy = StairEplbPolicy(config)
-    try:
-        with pytest.raises(ValueError, match="non-negative"):
-            policy.plan_sharded_rebalance(-loads, current, history, nodes, cpu_group)
-        actual = policy.plan_sharded_rebalance(
-            loads, current, history, nodes, cpu_group
-        )
-        for name in (
-            "rank_expert_ids",
-            "source_rank_ids",
-            "source_slot_ids",
-            "predicted_mean_ratios",
-            "imbalance_ratios",
-        ):
-            np.testing.assert_array_equal(
-                getattr(actual, name), getattr(expected, name)
-            )
-    finally:
-        policy.close()
-    with pytest.raises(RuntimeError, match="closed"):
-        policy.plan_sharded_rebalance(loads, current, history, nodes, cpu_group)
-
-
-def test_stair_does_not_restart_a_failed_planner(cpu_group):
-    """A dead planner must fail the engine operation instead of silently retrying."""
-    policy = StairEplbPolicy()
-    args = (
-        np.ones((2, 1, 2)),
-        np.array([[[0], [1]]]),
-        np.array([np.nan]),
-        np.array([0, 0]),
-        cpu_group,
+    stats = TemporalEplbStats(
+        torch.from_numpy(loads), 4, 1, 1, 2, (1,) * 4, tuple(nodes), history
     )
-    try:
-        policy.plan_sharded_rebalance(*args)
-        process = policy._process
-        assert process is not None
-        process.kill()
-        process.wait()
-        with pytest.raises(RuntimeError, match="exited unexpectedly"):
-            policy.plan_sharded_rebalance(*args)
-        with pytest.raises(RuntimeError, match="closed"):
-            policy.plan_sharded_rebalance(*args)
-    finally:
-        policy.close()
+    expected = StairPlanner.plan_rebalance(loads, current, history, nodes, config)
+    with closing(EplbPolicyProcess(StairEplbPolicy(config))) as process:
+        for _ in range(2):
+            actual = process.rebalance_experts(
+                stats, torch.from_numpy(current.reshape(2, 4))
+            )
+            np.testing.assert_array_equal(
+                actual.physical_to_logical_map, expected.rank_expert_ids.reshape(2, 4)
+            )
+            np.testing.assert_array_equal(
+                actual.source_rank_ids, expected.source_rank_ids
+            )
+            np.testing.assert_array_equal(
+                actual.source_slot_ids, expected.source_slot_ids
+            )
+            np.testing.assert_array_equal(
+                actual.predicted_mean_ratios, expected.predicted_mean_ratios
+            )
+        assert not psutil.Process(process._process.pid).children()
+        stats.global_expert_load_window.neg_()
+        with pytest.raises(EplbPolicyProcessError, match="non-negative"):
+            process.rebalance_experts(stats, torch.from_numpy(current.reshape(2, 4)))
+
+
+def test_stair_does_not_restart_a_failed_shared_planner():
+    """A dead shared planner fails instead of starting a private STAIR child."""
+    stats = TemporalEplbStats(
+        torch.ones(2, 1, 2), 2, 1, 1, 2, (1, 1), (0, 0), np.array([np.nan])
+    )
+    current = torch.tensor([[0, 1]])
+    with closing(EplbPolicyProcess(StairEplbPolicy())) as process:
+        process.rebalance_experts(stats, current)
+        process._process.kill()
+        process._process.wait()
+        with pytest.raises(EplbPolicyProcessError):
+            process.rebalance_experts(stats, current)
+        assert process._process.returncode != 0
+        with pytest.raises(EplbPolicyProcessError, match="closed"):
+            process.rebalance_experts(stats, current)
 
 
 def test_stair_profile_keeps_weights_without_starting_planner(temporal_model):
@@ -561,7 +567,10 @@ def test_stair_profile_keeps_weights_without_starting_planner(temporal_model):
         state.rearrange(is_profile=True)
         torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
         assert isinstance(state.policy, StairEplbPolicy)
-        assert state.policy._process is None
+        assert (
+            state.policy_process is None
+            or state.policy_process._process.poll() is not None
+        )
     finally:
         state.stop_async_loop()
 
@@ -587,7 +596,7 @@ def test_stair_rejects_unsupported_recovery(field):
         EplbState(config, torch.device("cpu"))
 
 
-def _stair_runtime_worker(rank, directory):
+def _stair_runtime_worker(rank, directory, use_process):
     parallel = ParallelConfig(
         tensor_parallel_size=2,
         distributed_executor_backend="mp",
@@ -613,6 +622,8 @@ def _stair_runtime_worker(rank, directory):
         initialize_model_parallel(tensor_model_parallel_size=2, backend="gloo")
         state = EplbState(parallel, torch.device("cpu"))
         try:
+            if use_process:
+                state.policy_process = EplbPolicyProcess(state.policy)
             model = _ExpertModel(ep_size=2)
             model.weight.data.add_(rank * model.weight.numel())
             model_config = ModelConfig(model=directory, skip_tokenizer_init=True)
@@ -643,18 +654,20 @@ def _stair_runtime_worker(rank, directory):
             with pytest.raises(
                 (ValueError, RuntimeError), match="non-negative|another"
             ):
-                state.policy.rebalance_experts(
-                    stats, model_state.physical_to_logical_map
-                )
+                state.rebalance_experts(stats, model_state.physical_to_logical_map)
         finally:
             state.stop_async_loop()
             assert isinstance(state.policy, StairEplbPolicy)
-            assert state.policy._process is None
+            assert (
+                state.policy_process is None
+                or state.policy_process._process.poll() is not None
+            )
             cleanup_dist_env_and_memory()
 
 
 @pytest.mark.distributed
-def test_stair_runtime_transfers_weights_and_commits_history(tmp_path):
+@pytest.mark.parametrize("use_process", [False, True])
+def test_stair_runtime_transfers_weights_and_commits_history(tmp_path, use_process):
     """Raw statistics, process shards, explicit sources and real Gloo agree."""
     LlamaConfig(
         hidden_size=32,
@@ -663,4 +676,6 @@ def test_stair_runtime_transfers_weights_and_commits_history(tmp_path):
         num_attention_heads=2,
         num_key_value_heads=2,
     ).save_pretrained(tmp_path)
-    mp.spawn(_stair_runtime_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    mp.spawn(
+        _stair_runtime_worker, args=(str(tmp_path), use_process), nprocs=2, join=True
+    )

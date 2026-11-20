@@ -53,6 +53,8 @@ class TemporalEplbStats(EplbStats):
 
 class AbstractEplbPolicy(ABC):
     requires_temporal_load: bool = False
+    shard_by_layer: bool = False
+    """Let the EPLB runtime partition temporal inputs and gather transfer plans."""
 
     def close(self) -> None:
         """Idempotently release resources after calls into the policy have stopped."""
