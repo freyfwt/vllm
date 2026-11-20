@@ -121,10 +121,11 @@ def worker(rank, args):
             )
 
             def measure_plans():
+                nonlocal actual
                 for _ in range(args.iterations):
                     torch.distributed.barrier(group=group)
                     started = time.perf_counter()
-                    plan(stats, old)
+                    actual = plan(stats, old)
                     elapsed = torch.tensor((time.perf_counter() - started) * 1000)
                     torch.distributed.all_reduce(
                         elapsed, op=torch.distributed.ReduceOp.MAX, group=group
@@ -169,6 +170,15 @@ def worker(rank, args):
                 actual.predicted_mean_ratios,
             ):
                 digest.update(np.asarray(value).tobytes())
+            expected_digest = hashlib.sha256()
+            for value in (
+                expected.rank_expert_ids.reshape(current.shape),
+                expected.source_rank_ids,
+                expected.source_slot_ids,
+                expected.predicted_mean_ratios,
+            ):
+                expected_digest.update(np.asarray(value).tobytes())
+            assert digest.digest() == expected_digest.digest()
             result = dict(
                 rank=rank,
                 transport=args.transport,
